@@ -1,0 +1,56 @@
+import json
+import falcon
+import cx_Oracle
+import collections
+import base64
+from .preconfig import c,REQUEST_TIME
+# my_dsn = cx_Oracle.makedsn("192.168.105.160",1521,service_name="DEV_DATABOT")
+# connection = cx_Oracle.connect(user="databot", password="oracle_Bot1", dsn=my_dsn)
+# cursor = connection.cursor()
+from .database import session_scope
+from sqlalchemy.orm import aliased
+from .base import BaseResource
+from .inis import MsdTbImageSparepart \
+    , MsdTbLinkImageSparepart , MsdTbSparepart
+from .utils import alchemyencoder
+class Images(BaseResource):
+    @REQUEST_TIME.time()
+    def on_get(self, req, resp):
+
+            # label_dict = {"method": "GET", "endpoint": "display_image"}
+            # c.labels(**label_dict).inc()
+        with self.session_scope() as session:
+            params = req.params
+            id_image = params.get('id_image', None)
+            # open_image ="""
+            #         select file_image from msd_tb_sparepart sp
+            #             join msd_tb_link_image_sparepart li on sp.ID_SPAREPART = li.ID_SPAREPART
+            #             join msd_tb_image_sparepart isp on isp.ID_IMAGE = li.ID_IMAGE
+            #         where isp.id_image = '{0}'
+            #                 """.format(id_image)
+            isp = aliased(MsdTbImageSparepart)
+            sp = aliased(MsdTbSparepart)
+            lsip = aliased(MsdTbLinkImageSparepart)
+            open_image = session.query(isp.file_image).select_from(sp)\
+                .filter(isp.id_image == '{}'.format(id_image)).first()
+
+            print(open_image[0])
+            # for row in open_image :
+                # print(open_image)
+            # a = cursor.execute(open_image)
+            # blob = ""
+            # for query in a:
+            #     imageBlob = query[0]
+            #     blob= imageBlob.read()
+            #     break
+            # imageBlob = query[0]
+            # blob= imageBlob.read()
+            resp.body = open_image[0]
+            resp.content_type = 'image/jpg'
+            # gambar = {
+            #     'ini' : 'gambar'
+            # }
+            # resp.body = blob
+            # resp.body = json.dumps(gambar)
+            # resp.content_type = 'image/jpg'
+            resp.status = falcon.HTTP_200

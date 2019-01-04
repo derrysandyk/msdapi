@@ -1,0 +1,172 @@
+import json
+import falcon
+import cx_Oracle
+import collections
+my_dsn = cx_Oracle.makedsn("192.168.105.160",1521,service_name="DEV_DATABOT")
+connection = cx_Oracle.connect(user="databot", password="oracle_Bot1", dsn=my_dsn)
+cursor1 = connection.cursor()
+cursor2 = connection.cursor()
+class sparepart_search(object):
+    def on_get(self, req, resp):
+        params = req.params
+        brand = params.get('brand', None)
+        model = params.get('model', None)
+        year = params.get('year', None)
+        capacity = params.get('capacity', None)
+        transmission = params.get('transmission', None)
+        grouping = params.get('grouping', None)
+        assembly_set = params.get('assembly_set', None)
+        part_name = params.get('part_name', None)
+        part_number = params.get('part_number', None)
+        vin = params.get('vin', None)
+        grade = params.get('grade', None)
+        wheel_drive = params.get('wheel_drive', None)
+        drive = params.get('drive', None)
+        body_kend = params.get('body_kend', None)
+        seating_number = params.get('seating_number', None)
+        door_number = params.get('door_number', None)
+        area = params.get('area', None)
+        nama_panel = params.get('nama_panel', None)
+
+        select_data = """
+           select distinct sp.id_sparepart, sp.part_name , sp.part_number, th.currency, th.harga, pl.nama_panel, asse.assembly_set, gr.group_part
+            , merek.merek_kend, mdl.model_kend, mc.prod_from, mc.prod_upto
+            , mc.displacement, mc.transmission
+            , sp.ref_no , sp.qty, sp.qty_rep_part, sp.deskripsi, sp.app_from, sp.app_upto, sp.remark_rep_part
+            ,mc.grade , mc.wheel_drive, mc.drive, mc.body_kend, mc.seating_number, mc.door_number, mc.area
+            ,sp.rep_part
+            from msd_tb_sparepart sp
+            
+            join msd_tb_grouping gr
+                on gr.id_group_part = sp.id_group_part
+            join msd_tb_assembly_set asse
+                on asse.id_assembly_set = sp.id_assembly_set
+            join MSD_TB_ALIAS_PANEL ap
+                on ap.id_sparepart = sp.id_sparepart
+            join MSD_tb_panel_master pl
+                on ap.id_panel = pl.id_panel
+            left join msd_tb_harga th
+                on th.id_sparepart = sp.id_sparepart
+            join msd_tb_model_covered mc
+                on mc.id_model_covered = sp.id_model_covered
+            join msd_tb_model_kend mdl
+                on mdl.id_model_kend = mc.id_model_kend
+            join msd_tb_merek_kend merek
+                on merek.id_merek_kend = mdl.id_merek_kend
+            join a_tb_vin vin 
+                on vin.id_model_covered = mc.id_model_covered
+        """
+
+        group1_query, group2_query, group3_query = [], [], []
+        # filter group 1: vin
+        if vin:
+            group1_query.append("vin.vin like '%{}%'".format(vin.upper()))
+
+        # filter group 2: brand, model, year, capacity, transmission, grouping, assembly_set, grade, wheel_drive
+        # , drive, body_kend, seating_number, door_number, area
+        group2 = []
+        if brand:
+            group2.append("merek.merek_kend like '%{}%'".format(brand.upper()))
+        if model:
+            group2.append("mdl.model_kend like '%{}%'".format(model.upper()))
+        if year:
+            group2.append("({} between mc.prod_from and mc.prod_upto)".format(int(year)))
+        if capacity:
+            group2.append("mc.displacement = '{}'".format(capacity.upper()))
+        if transmission:
+            group2.append("mc.transmission = '{}'".format(transmission.upper()))
+        if grouping:
+            group2.append("gr.group_part like '%{}%'".format(grouping.upper()))
+        if assembly_set:
+            group2.append("asse.assembly_set like '%{}%'".format(assembly_set.upper()))
+        if grade:
+            group2.append("mc.grade like '%{}%'".format(grade.upper()))
+        if wheel_drive:
+            group2.append("mc.wheel_drive like '%{}%'".format(wheel_drive.upper()))
+        if drive:
+            group2.append("mc.drive like '%{}%'".format(drive.upper()))
+        if body_kend:
+            group2.append("mc.body_kend like '%{}%'".format(body_kend.upper()))
+        if seating_number:
+            group2.append("mc.seating_number like '%{}%'".format(seating_number.upper()))
+        if door_number:
+            group2.append("mc.door_number like '%{}%'".format(door_number.upper()))
+        if area:
+            group2.append("mc.area like '%{}%'".format(area.upper()))
+        if len(group2) > 0:
+            group2_query.append(' ( ' + " and ".join([itm for itm in group2]) + ' ) ')
+
+        # filter group 3: part_name, part_number, nama_panel
+        group3 = []
+        if part_name:
+            string1 = ""
+            num = 0
+            if isinstance(part_name, (list,)):
+                for part in part_name:
+                    if num == 0:
+                        string1 += part + ","
+                        num += 1
+                    else:
+                        string1 += part
+                print(string1)
+                group3.append("sp.part_name like upper('%{}%')".format(string1))
+            else:
+                group3.append("sp.part_name like upper('%{}%')".format(part_name))
+        if part_number:
+            group3.append("sp.part_number like '%{}%'".format(part_number.upper()))
+        if nama_panel:
+            group3.append("pl.nama_panel like '%{}%'".format(nama_panel.upper()))
+        if len(group3) > 0:
+            group3_query = ' ( ' + " or ".join([itm for itm in group3]) + ' ) '
+
+        print('group1_query:', group1_query)
+        print('group2_query:', group2_query)
+        print('group3_query:', group3_query)
+        condition_query = ' where '
+
+        if len(group1_query) > 0 or len(group2_query) > 0:
+            condition_query += ' ( ' + ' or '.join(group1_query+group2_query) + ' ) '
+        else:
+            condition_query += ' 1=1 '
+        if len(group3) > 0:
+            condition_query += ' and {}'.format(group3_query)
+
+        print('condition_query:', condition_query)
+        objects = {}
+        for sumber in ['EPC', 'KATALOG', 'WEB']:
+            sumber_query = " and sp.sumber = '{}'".format(sumber.upper())
+            # print(select_data+condition_query+sumber_query)
+            a = cursor1.execute(select_data+condition_query+sumber_query)
+            objects_list = []
+            for query in a:
+                d = collections.OrderedDict()
+                d["part_number"] = query[2]
+                d["part_name"] = query[1]
+                d["currency"] = query[3]
+                d["harga"] = query[4]
+                d["nama_panel"] = query[5]
+                d["ref_no"] = query[14]
+                d["qty"] = query[15]
+                d["qty_rep_part"] = query[16]
+                d["deskripsi"] = query[17]
+                d["app_from"] = query[18]
+                d["app_auto"] = query[19]
+                d["remark_rep_part"] = query[20]
+                d["rep_part"] = query[28]
+                select_image = """
+                            select isp.id_image from msd_tb_sparepart sp
+                                join msd_tb_link_image_sparepart li on sp.ID_SPAREPART = li.ID_SPAREPART
+                                join msd_tb_image_sparepart isp on isp.ID_IMAGE = li.ID_IMAGE
+                                    where sp.id_sparepart = '{0}'
+                                    """.format(query[0])
+                b = cursor2.execute(select_image)
+                objects_list2 = []
+                for query2 in b:
+                    link_image = "http://192.168.105.102:8000/image/?id_image={0}".format(query2[0])
+                    objects_list2.append(link_image)
+                d["image"] = objects_list2
+                objects_list.append(d)
+            objects[sumber] = objects_list
+
+        resp.body = json.dumps(objects)
+        resp.status = falcon.HTTP_200

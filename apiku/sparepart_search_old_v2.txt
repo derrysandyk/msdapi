@@ -1,0 +1,336 @@
+import falcon
+import json
+from sqlalchemy import and_, or_, between, func, desc
+from sqlalchemy.orm import aliased
+from datetime import datetime
+from sqlalchemy.dialects import oracle
+from .base import BaseResource
+from sqlalchemy.sql.functions import coalesce
+from .falcon_pagination.offset_pagination_hook import OffsetPaginationHook
+from .database import session_scope
+from .inis import MsdTbAliasPanel, MsdTbAssemblySet, MsdTbGrouping, MsdTbHarga, MsdTbImageSparepart\
+    , MsdTbLinkImageSparepart, MsdTbMerekKend, MsdTbModelCovered, MsdTbModelKend, MsdTbPanelMaster, MsdTbSparepart\
+    , MsdTbVin,MsdTbMasterKend, MsdTbMappingMstKend
+from .utils import alchemyencoder
+import math
+from functools import lru_cache
+from .rediscache import my_cache,cache_it_json, cache_it
+# from rediscache import cache_it_json, cache_it
+
+class sparepart_search(BaseResource):
+    @falcon.before(OffsetPaginationHook(
+    default_limit=10,
+    max_limit=500,
+    offset_key='offset',
+    limit_key='limit'))
+    def on_get(self, req, resp):
+        # session = session_scope()
+        with self.session_scope() as session:
+            params = req.params
+
+            list_params = []
+            all_query_params = {}
+
+            valid_params = ('brand', 'model', 'year', 'displacement', 'transmission', 'grouping', 'assembly_set'
+                            , 'part_name', 'part_number', 'grade', 'wheel_drive', 'drive', 'body_kend', 'seating_number'
+                            , 'door_number', 'area', 'nama_panel', 'vin', 'tipe_kendaraan')
+            for param in valid_params:
+                curr_param = params.get(param, None)
+                if curr_param:
+                    if 'part_name' == param:
+                        curr_param = ",".join(curr_param) if isinstance(curr_param, list) else curr_param
+                    if 'part_number' == param:
+                        curr_param = curr_param.replace('-', '')
+                    if 'vin' == param:
+                        curr_param = curr_param[:12]
+
+                    curr_param = curr_param.strip()
+                    list_params.append("{}={}".format(param, curr_param))
+                    all_query_params[param] = curr_param
+
+            show_co_occur = set(all_query_params).intersection({'part_name', 'part_number', 'nama_panel', 'assembly_set'})
+
+            def sp_query_builder(brand=None, model=None, year=None, displacement=None, transmission=None, grouping=None,
+                            assembly_set=None, part_name=None, part_number=None, grade=None, wheel_drive=None,
+                            drive=None, body_kend=None, seating_number=None, door_number=None, area=None,
+                            nama_panel=None, vin=None, tipe_kendaraan=None, sumber=None):
+
+                # alias
+                vin_tb = aliased(MsdTbVin)
+                mc = aliased(MsdTbModelCovered)
+                sp = aliased(MsdTbSparepart)
+                th = aliased(MsdTbHarga)
+                th_ = aliased(MsdTbHarga)
+                ap = aliased(MsdTbAliasPanel)
+                pl = aliased(MsdTbPanelMaster)
+                asse = aliased(MsdTbAssemblySet)
+                gr = aliased(MsdTbGrouping)
+                mdl = aliased(MsdTbModelKend)
+                merek = aliased(MsdTbMerekKend)
+                mkend = aliased(MsdTbMasterKend)
+                mk_map = aliased(MsdTbMappingMstKend)
+
+                harga_query = session.query(th.id_sparepart, func.max(th.last_update).label("latest")) \
+                    .group_by(th.id_sparepart) \
+                    .subquery()
+
+                fields = (sp.id_sparepart, sp.part_name, sp.part_number
+                        , th_.currency, th_.harga
+                        , pl.nama_panel, asse.assembly_set
+                        , gr.group_part, merek.merek_kend, mdl.model_kend, mc.prod_from, mc.prod_upto, mc.displacement
+                        , mc.transmission, sp.ref_no, sp.qty, sp.rep_part, sp.qty_rep_part, sp.deskripsi, sp.app_from
+                        , sp.app_upto, sp.remark_rep_part, mc.grade, mc.wheel_drive, mc.drive, mc.body_kend
+                        , mc.seating_number, mc.door_number, mc.area, mc.engine
+                        , pl.id_panel, mc.id_model_covered, merek.id_merek_kend
+                        # , vin_tb.vin
+                        )
+
+                # query select join
+                spareparts = session.query(*fields).select_from(sp).distinct()
+                if vin:
+                    spareparts = spareparts.join(vin_tb, vin_tb.id_model_covered == sp.id_model_covered)
+                spareparts = spareparts.join(mc, sp.id_model_covered == mc.id_model_covered) \
+                    .join(mdl, mc.id_model_kend == mdl.id_model_kend) \
+                    .join(merek, merek.id_merek_kend == mdl.id_merek_kend) \
+                    .join(asse, sp.id_assembly_set == asse.id_assembly_set) \
+                    .join(gr, sp.id_group_part == gr.id_group_part) \
+                    .outerjoin(ap, sp.id_sparepart == ap.id_sparepart) \
+                    .outerjoin(pl, ap.id_panel == pl.id_panel) \
+                    .outerjoin(harga_query, harga_query.c.id_sparepart == sp.id_sparepart) \
+                    .outerjoin(th_, and_(th_.last_update == harga_query.c.latest, th_.id_sparepart == sp.id_sparepart))
+                if tipe_kendaraan:
+                    spareparts = spareparts.join(mk_map, mk_map.id_model_covered == mc.id_model_covered)
+                    spareparts = spareparts.join(mkend, mkend.id_master_kend == mk_map.id_master_kend)
+
+                # model_filter (AND)
+                model_filter = []
+                if brand:
+                    model_filter.append(merek.merek_kend.ilike('%{}%'.format(brand)))
+                if model:
+                    model_filter.append(mdl.model_kend.ilike('%{}%'.format(model)))
+                if year:
+                    model_filter.append(between(year, mc.prod_from, coalesce(mc.prod_upto, datetime.now().year)))
+                if displacement:
+                    model_filter.append(mc.displacement.ilike('%{}%'.format(displacement)))
+                if transmission:
+                    model_filter.append(mc.transmission.ilike('%{}%'.format(transmission)))
+                if grouping:
+                    model_filter.append(gr.group_part.ilike('%{}%'.format(grouping)))
+                if grade:
+                    model_filter.append(mc.grade.ilike('%{}%'.format(grade)))
+                if wheel_drive:
+                    model_filter.append(mc.wheel_drive.ilike('%{}%'.format(wheel_drive)))
+                if drive:
+                    model_filter.append(mc.drive.ilike('%{}%'.format(drive)))
+                if body_kend:
+                    model_filter.append(mc.body_kend.ilike('%{}%'.format(body_kend)))
+                if seating_number:
+                    model_filter.append(mc.seating_number.ilike('%{}%'.format(seating_number)))
+                if door_number:
+                    model_filter.append(mc.door_number.ilike('%{}%'.format(door_number)))
+                if area:
+                    model_filter.append(mc.area.ilike('%{}%'.format(area)))
+                model_filter_group = and_(*model_filter).self_group()
+
+                if vin:
+                    # spareparts = spareparts.filter(or_(vin_tb.vin.ilike('%{}%'.format(vin)), model_filter_group))
+                    spareparts = spareparts.filter(vin_tb.vin.ilike('%{}%'.format(vin)))
+
+                if tipe_kendaraan:
+                    spareparts = spareparts.filter(mkend.tipe_kendaraan.ilike('%{}%'.format(tipe_kendaraan)))
+
+                # spareparts = spareparts.filter(th.harga.isnot(None))
+
+                spareparts = spareparts.filter(model_filter_group)
+
+                # sparepart_filter (OR)
+                sparepart_filter = []
+                if assembly_set:
+                    sparepart_filter.append(asse.assembly_set.ilike('%{}%'.format(assembly_set)))
+                if part_name:
+                    part_name = part_name.strip()
+                    sparepart_filter.append(sp.part_name.ilike('%{}%'.format(part_name)))
+                if part_number:
+                    sparepart_filter.append(sp.part_number.ilike('%{}%'.format(part_number)))
+                    sparepart_filter.append(sp.rep_part.ilike('%{}%'.format(part_number)))
+                if nama_panel:
+                    sparepart_filter.append(pl.nama_panel.ilike('%{}%'.format(nama_panel)))
+                sparepart_filter_group = or_(*sparepart_filter).self_group()
+                spareparts = spareparts.filter(sparepart_filter_group)
+                if sumber:
+                    return spareparts.filter(sp.sumber.ilike('%{}%'.format(sumber)))
+                else:
+                    return spareparts
+
+            @cache_it(cache=my_cache, expire=60*60)
+            def sp_run_query_total_count(**kwargs):
+                return sp_query_builder(**kwargs).count()
+
+            @cache_it(cache=my_cache, expire=60*60)
+            def sp_run_query_current_count(limit, offset, **kwargs):
+                return sp_query_builder(**kwargs).limit(limit).offset(offset).count()
+
+            @cache_it(cache=my_cache, expire=60*60)
+            def sp_run_query(limit, offset, **kwargs):
+                result = sp_query_builder(**kwargs).limit(limit).offset(offset)
+                retval = []
+                for row_itm in result:
+                    retval.append(row_itm)
+                return retval
+
+            try:
+                # get sumbers
+                sumbers = get_sumber_from_sparepart()
+
+                page = int(params.get('page', 1))
+                limit = int(req.context['pagination']['limit'])
+                offset = (page - 1) * limit
+                total_count = 0
+                objects = {}
+                total_count_sumber = {}
+                for sumber in sumbers:
+                    # objects[sumber] = []
+                    # print(str(spareparts.statement.compile(dialect=oracle.dialect())))
+                    all_query_params.update({'sumber': sumber})
+
+                    total_count_sumber[sumber] = sp_run_query_total_count(**all_query_params)
+                    if total_count_sumber == 0:
+                        continue
+
+                    total_count += total_count_sumber[sumber]
+
+                    data_from_sumber = sp_run_query(limit, offset, **all_query_params)
+                    for row in data_from_sumber:
+                        # print('row', row)
+                        data = {}
+
+                        fields = ('id_sparepart', 'part_name', 'part_number'
+                                , 'currency', 'harga'
+                                , 'nama_panel', 'assembly_set'
+                                , 'group_part', 'merek_kend', 'model_kend', 'prod_from', 'prod_upto', 'displacement'
+                                , 'transmission', 'ref_no', 'qty', 'rep_part', 'qty_rep_part', 'deskripsi', 'app_from'
+                                , 'app_upto', 'remark_rep_part', 'grade', 'wheel_drive', 'drive', 'body_kend'
+                                , 'seating_number', 'door_number', 'area', 'engine'
+                                , 'id_panel', 'id_model_covered', 'id_merek_kend'
+                                # , 'vin'
+                                )
+                        for index, value in enumerate(fields):
+                            data[value] = row[index]
+
+                        # get id_image
+                        sparepart_id = row[0]
+                        data['image'] = get_image_ids(sparepart_id)
+
+                        id_merek_kend = row[-1]
+                        data['abbreviation'] = get_abbreviation(id_merek_kend).strip()
+                        # get co_occurrence
+                        if show_co_occur:
+                            part_number = row[2]
+                            panel_id = row[-3]
+                            id_model_covered = row[-2]
+                            data['co-occurrence'] = get_co_occurrence(panel_id, id_model_covered, part_number)
+
+                        if sumber not in objects:
+                            objects[sumber] = []
+
+                        objects[sumber].append(data)
+
+                # total_page = math.ceil(total_count / limit)
+                main_params = "/sparepart_search?"
+                for para in list_params:
+                    if list_params[len(list_params) - 1] == para:
+                        main_params += para
+                    else:
+                        main_params += para + "&"
+                print(main_params)
+                # print(main)
+                if page == 1:
+                    prev_page = None
+                else:
+                    prev_page = "{0}&page={1}".format(main_params, page - 1)
+
+                next_page_exist = False
+                for idx, count in total_count_sumber.items():
+                    if count == 0:
+                        continue
+                    elif (page + 1) * limit <= count:
+                        next_page_exist = True
+                        break
+                    elif (page + 1) * limit > count and not (page + 1) * limit - count >= limit:
+                        next_page_exist = True
+                        break
+
+                if not next_page_exist:
+                    nex_page = None
+                else:
+                    nex_page = "{0}&page={1}".format(main_params, page + 1)
+
+                respon = {
+                    "count": total_count,
+                    "next": nex_page,
+                    "previous": prev_page,
+                    "results": objects
+                }
+                resp.body = json.dumps(respon, default=alchemyencoder)
+                resp.status = falcon.HTTP_200
+
+            except Exception as e:
+
+                resp.body = json.dumps({'error': '{} - {}'.format(type(e), str(e))})
+                resp.status = falcon.HTTP_500
+
+
+
+@lru_cache(maxsize=128)
+def get_harga_by_sparepart(id_sparepart=None):
+    if not id_sparepart:
+        return {}
+
+    with session_scope() as session:
+        try:
+            fields = (MsdTbHarga.currency, MsdTbHarga.harga, MsdTbHarga.last_update)
+            harga = session.query(*fields) \
+                .filter(MsdTbHarga.id_sparepart == id_sparepart).order_by(MsdTbHarga.last_update.desc()).first()
+            data = {}
+            for index, value in enumerate(fields):
+                data[value.key] = getattr(harga, value.key)
+            return data
+        except Exception as e:
+            return {}
+
+
+@cache_it(cache=my_cache)
+def get_image_ids(id_sparepart=None):
+    result = []
+    if not id_sparepart:
+        return result
+
+    with session_scope() as session:
+        li = aliased(MsdTbLinkImageSparepart)
+        image = session.query(li.id_image) \
+            .filter(li.id_sparepart == id_sparepart)
+        for res in image.all():
+            link_image = "/image/?id_image={0}".format(res[0])
+            result.append(link_image)
+        session.close()
+        return result
+
+
+@lru_cache(maxsize=128)
+def get_co_occurrence(id_panel=None,id_model_covered=None,part_number=None):
+    result = "/co_occurrence/?id_panel={0}&id_model_covered={1}&part_number={2}".format(id_panel,id_model_covered,part_number)
+    return result
+
+@lru_cache(maxsize=128)
+def get_abbreviation(id_merek_kend = None):
+    result = "/abbreviation/{0}".format(id_merek_kend)
+    return result
+
+
+@cache_it(cache=my_cache)
+def get_sumber_from_sparepart():
+    with session_scope() as session:
+        sumbers = [itm[0] for itm in session.query(MsdTbSparepart.sumber).distinct()]
+        sumbers.sort()
+        session.close()
+        return sumbers

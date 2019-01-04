@@ -1,0 +1,93 @@
+import json
+import falcon
+import cx_Oracle
+import collections
+from .preconfig import c,REQUEST_TIME
+from .auth import AuthMiddleware as am
+my_dsn = cx_Oracle.makedsn("192.168.105.160",1521,service_name="DEV_DATABOT")
+connection = cx_Oracle.connect(user="databot", password="oracle_Bot1", dsn=my_dsn)
+cursor1 = connection.cursor()
+cursor2 = connection.cursor()
+class Resource3(object):
+    @falcon.before(am.validate_auth)
+    def on_get(self, req, resp):
+        params = req.params
+        vin_code = params.get('vin', None)
+        panel = params.get('nama_panel', None)
+        select_data2 = """
+        select distinct s.id_sparepart, s.part_number, s.part_name, h.currency, h.harga, ap.id_panel , pl.nama_panel from a_tb_vin vin 
+        join msd_tb_model_covered mc 
+            on vin.id_model_covered = mc.id_model_covered 
+        join msd_tb_sparepart s 
+            on mc.id_model_covered = s.id_model_covered 
+        left join msd_tb_harga h 
+            on s.id_sparepart = h.id_sparepart 
+        join MSD_TB_ALIAS_PANEL ap 
+            on ap.id_sparepart = s.id_sparepart 
+        join MSD_tb_panel_master pl 
+            on ap.id_panel = pl.id_panel 
+        where 
+                vin.VIN = '{0}' 
+                and upper(pl.nama_panel) = upper('{1}') 
+        order by s.id_sparepart
+        """.format(vin_code,panel)
+        a = cursor1.execute(select_data2)
+        objects_list = []
+        id_panel_utama = ""
+        for query in a:
+            d = collections.OrderedDict()
+            d["id_sparepart"] = query[0]
+            d["part_number"] = query[1]
+            d["part_name"] = query[2]
+            d["currency"] = query[3]
+            d["harga"] = query[4]
+            d["id_panel"] = query[5]
+            id_panel_utama = query[5]
+            objects_list.append(d)
+        select_data3 = """
+        select distinct s.id_sparepart, s.part_number, s.part_name, h.currency, h.harga, pl.id_panel, pl.nama_panel from a_tb_vin vin
+            join msd_tb_model_covered mc 
+                on vin.id_model_covered = mc.id_model_covered
+            join msd_tb_sparepart s 
+                on mc.id_model_covered = s.id_model_covered
+            left join msd_tb_harga h 
+                on s.id_sparepart = h.id_sparepart
+            join MSD_TB_ALIAS_PANEL ap 
+                on ap.id_sparepart = s.id_sparepart
+            join MSD_tb_panel_master pl 
+                on ap.id_panel = pl.id_panel
+            where vin.VIN = '{0}' and ap.id_panel != '{1}' and ap.id_panel in
+            (
+                select id_panel from tb_panel_matching_test2
+                where indeks_lokasi in
+                (
+                    select pm.indeks_lokasi from msd_tb_panel_master p
+                    join tb_panel_matching_test2 pm
+                    on p.id_panel = pm.id_panel
+                    where upper(p.nama_panel) = upper('{2}')
+                )
+            )
+            order by s.id_sparepart
+        """.format(vin_code,id_panel_utama,panel)
+
+
+        b = cursor2.execute(select_data3)
+        objects_list2 = []
+        for query in b:
+            d2 = collections.OrderedDict()
+            d2["id_sparepart"] = query[0]
+            d2["part_number"] = query[1]
+            d2["part_name"] = query[2]
+            d2["currency"] = query[3]
+            d2["harga"] = query[4]
+            d2["id_panel"] = query[5]
+            d2["nama_panel"] = query[6]
+            objects_list2.append(d2)
+        temp1={
+            'panel_info' : objects_list,
+            'co_occurrence' : objects_list2
+        }
+        resp.body = json.dumps(temp1)                
+        resp.status = falcon.HTTP_200
+        
+        
